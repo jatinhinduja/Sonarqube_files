@@ -1,0 +1,175 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS CloudFormation Template for Sonarqube'
+Parameters:
+  KeyPair:
+    Description: Name of the keypair to use for SSH access
+    Type: String
+
+  ImageId:
+    Description: The AMI ID for Amazon Linux 2 AMI.
+    Type: String
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: 'true'
+      EnableDnsHostnames: 'true'
+      CidrBlock: 10.0.0.0/16
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: VPC
+      CidrBlock: 10.0.0.0/24
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId:
+        Ref: VPC
+      InternetGatewayId:
+        Ref: InternetGateway
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: VPC
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId:
+        Ref: PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId:
+        Ref: InternetGateway
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: PublicSubnet
+      RouteTableId:
+        Ref: PublicRouteTable
+  PublicSubnetNetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId:
+        Ref: PublicSubnet
+      NetworkAclId:
+        Fn::GetAtt:
+        - VPC
+        - DefaultNetworkAcl
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable HTTP ingress
+      VpcId:
+        Ref: VPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: '80'
+        ToPort: '80'
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: '9000'
+        ToPort: '9000'
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: '22'
+        ToPort: '22'
+        CidrIp: 0.0.0.0/0
+  WebServerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.medium
+      ImageId: !Ref ImageId 
+      # AvailabilityZone: us-west-2a
+      NetworkInterfaces:
+      - GroupSet:
+        - Ref: WebServerSecurityGroup
+        AssociatePublicIpAddress: 'true'
+        DeviceIndex: '0'
+        DeleteOnTermination: 'true'
+        SubnetId:
+          Ref: PublicSubnet
+      KeyName:
+        Ref: KeyPair
+      Tags:
+        - Key: Name
+          Value: Sonarqube
+        - Key: Type
+          Value: Sonarqube
+      UserData:
+        'Fn::Base64':
+          !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd.x86_64
+            systemctl start httpd.service
+            systemctl enable httpd.service
+            echo “Hello World from $(hostname -f)” > /var/www/html/index.html
+            
+            sudo amazon-linux-extras install postgresql10
+            sudo yum install -y postgresql-server postgresql-devel
+            sudo /usr/bin/postgresql-setup --initdb
+            sudo systemctl start postgresql
+            sudo -u postgres psql -c "create user sonar with encrypted password 'H3LLoJ4t1n';"
+            sudo -u postgres psql -c 'create database sonarqube;'
+            sudo -u postgres psql -c 'grant all privileges on database sonarqube to sonar;'
+            
+            sudo echo  > /var/lib/pgsql/data/pg_hba.conf
+            sudo echo $'local   all     sonar   md5\nlocal   all     all     peer\nhost    all     all     127.0.0.1/32    md5\nhost    all     all     ::1/128         md5\n'  >> /var/lib/pgsql/data/pg_hba.conf
+            
+            sudo systemctl restart postgresql
+            sudo groupadd sonar
+            sudo useradd -c “SonarDemoJstw” -d /opt/sonarqube -g sonar -s /bin/bash sonar
+            sudo passwd sonar
+            sudo usermod -a -G sonar ec2-user
+            sudo curl -O https://download.java.net/java/GA/jdk11/13/GPL/openjdk-11.0.1_linux-x64_bin.tar.gz
+            sudo tar zxvf openjdk-11.0.1_linux-x64_bin.tar.gz
+            sudo mv jdk-11.0.1 /usr/local/
+            sudo chmod -R 755 /usr/local/jdk-11.0.1
+
+            sudo echo $'export JAVA_HOME=/usr/local/jdk-11.0.1\nexport PATH=$JAVA_HOME/bin:$PATH\n'  >> /etc/profile
+  
+            sudo source /etc/profile
+            sudo wget https://binaries.sonarsource.com/Distribution/sonarqube/sonarqube-7.9.1.zip
+            sudo unzip sonarqube-7.9.1.zip
+            sudo mv -v sonarqube-7.9.1/* /opt/sonarqube
+            sudo chown -R sonar:sonar /opt/sonarqube
+            sudo chmod -R 775 /opt/sonarqube
+
+            sudo sed -i 's/wrapper.java.command=java/#wrapper.java.command=java/g' opt/sonarqube/conf/wrapper.conf
+            sudo sed -i '/#wrapper.java.command=java/a wrapper.java.command=/usr/local/jdk-11.0.1/bin/java' opt/sonarqube/conf/wrapper.conf
+
+            
+            sudo sed -i '1s/^/RUN_AS_USER=sonar\n /' /opt/sonarqube/bin/linux-x86-64/sonar.sh
+            
+            sudo echo $'sonar.jdbc.username=sonar\nsonar.jdbc.password=H3LLoJ4t1n\nsonar.jdbc.url=jdbc:postgresql://localhost/sonarqube\nsonar.web.javaOpts=-Djava.net.preferIPv4Stack=true\nsonar.web.javaAdditionalOpts=-server\nsonar.web.host=0.0.0.0\n'  >> /opt/sonarqube/conf/sonar.properties
+            
+            sudo echo $'DefaultLimitNOFILE=65536\n'  >> /etc/systemd/user.conf
+            
+            sudo echo $'DefaultLimitNOFILE=65536\n'  >> /etc/systemd/system.conf
+            
+            sudo echo $'*  soft    nofile  65536\n*  hard    nofile  65536\nelasticsearch   soft    nofile  65536\nelasticsearch   hard    nofile  65536\nelasticsearch   memlock unlimited\n'  >>  /etc/security/limits.conf
+            
+            sudo echo $'vm.max_map_count=262144\n'  >> /etc/sysctl.conf
+            
+
+            sudo sysctl -p
+            sudo systemctl restart postgresql
+            sudo /opt/sonarqube/bin/linux-x86-64/sonar.sh start
+
+Outputs:
+  URL:
+    Description: URL of the sample website for now
+    Value:
+      Fn::Join:
+      - ''
+      - - http://
+        - Fn::GetAtt:
+          - WebServerInstance
+          - PublicDnsName
